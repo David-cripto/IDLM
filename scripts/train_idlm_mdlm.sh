@@ -1,0 +1,23 @@
+python -u -m main \
+  loader.batch_size=8 \
+  loader.eval_batch_size=8 \
+  loader.num_workers=1 \
+  model=small \
+  data=openwebtext-split \
+  strategy.find_unused_parameters=True \
+  adversarial_distill.is_distill=True \
+  algo=mdlm \
+  algo.backbone='hf_dit' \
+  eval.checkpoint_path='kuleshov-group/mdlm-owt' \
+  model.length=1024 \
+  eval.compute_generative_perplexity=True \
+  trainer.accumulate_grad_batches=1 \
+  trainer.gradient_clip_val=null \
+  trainer.precision=32 \
+  training.loss_precision=float32 \
+  logger.name=idlm-mdlm \
+  sampling.steps=32 \
+  sampling.predictor='ancestral' \
+  optim.lr=1e-6 \
+  trainer.val_check_interval=1500 \
+  trainer.limit_val_batches=0.01 
