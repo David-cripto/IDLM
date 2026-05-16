@@ -1,8 +1,7 @@
-# IDLM: Inverse-distilled Diffusion Language Models
+# [IDLM: Inverse-distilled Diffusion Language Models (ICML 2026)](https://arxiv.org/abs/2602.19066)
 
 <p align="center">
   <b>Few-step text generation from distilled diffusion.</b><br>
-  Research code for <i>IDLM: Inverse-distilled Diffusion Language Models</i> (ICML 2026).
 </p>
 
 <p align="center">
@@ -19,26 +18,23 @@
   </a>
 </p>
 
+<div align="center">
+  <img src="https://github.com/David-cripto/IDLM/blob/main/assets/teaser.png" width="60%">
+</div>
+
 
 ## What is IDLM?
 
 Diffusion Language Models can generate high-quality text, but their iterative reverse-diffusion sampling makes inference slow. **IDLM** speeds them up by distilling a pretrained many-step diffusion language model into a **few-step generator**.
 
-Instead of simply matching every teacher step, IDLM uses an inverse-distillation view for discrete token spaces:
-
-1. start with a strong pretrained DLM teacher,
-2. train a student generator to produce text in far fewer steps,
-3. train a “fake” diffusion model on student samples,
-4. update the student using the teacher–fake loss gap.
-
-The paper reports **4×–64× fewer inference steps** while preserving the teacher model’s entropy and generative perplexity.
+Instead of simply matching every teacher step, IDLM uses an [Inverse Distillation](https://arxiv.org/abs/2502.01362) view for discrete token spaces.The paper reports **4×–64× fewer inference steps** while preserving the teacher model’s entropy and generative perplexity.
 
 ---
 
 ## Highlights
 
 - **Fast diffusion-language generation** with 4, 8, 16, and 32 step sampling recipes.
-- **Inverse distillation for discrete tokens**, including student/fake-model training logic.
+- **Inverse distillation for discrete tokens**, including student/fake models training logic.
 - **Hydra-powered experiments** for easy configuration and reproducibility.
 - **PyTorch Lightning training loop** with checkpointing, logging, and distributed training support.
 - **Ready-to-run scripts** for MDLM, DUO, and DCD-style recipes.
@@ -51,7 +47,7 @@ The paper reports **4×–64× fewer inference steps** while preserving the teac
 ```text
 IDLM/
 ├── configs/                 # Hydra configs: data, model, algo, strategy, callbacks, etc.
-│   ├── algo/                # ar, mdlm, duo, duo_base, d3pm, sedd, distillation, ot-finetune
+│   ├── algo/                # ar, mdlm, duo, duo_base, d3pm, sedd
 │   ├── data/                # OpenWebText configs
 │   ├── model/               # tiny / small / medium model configs
 │   ├── noise/               # diffusion noise schedules
@@ -71,7 +67,8 @@ IDLM/
 
 ---
 
-## Setup
+## Getting Started
+<a name="getting_started"></a>
 
 ### 1. Clone the repository
 
@@ -82,80 +79,32 @@ cd IDLM
 
 ### 2. Create an environment
 
-The provided configs target a CUDA setup. Adjust the Python, PyTorch, and CUDA versions to your machine if needed.
+To get started, create a conda environment containing the required dependencies.
 
 ```bash
-conda create -n idlm python=3.10 -y
+conda create -n idlm python=3.12
 conda activate idlm
+conda install nvidia/label/cuda-12.4.0::cuda-toolkit
+pip install -r requirements.txt
+pip install flash_attn==2.7.4.post1
 ```
-
-Install the CUDA toolkit version used by the provided environment note:
-
-```bash
-conda install nvidia/label/cuda-12.4.0::cuda-toolkit -y
-```
-
-Install the main Python stack:
-
-```bash
-pip install -U pip
-
-pip install \
-  datasets==2.15.0 \
-  einops==0.7.0 \
-  fsspec \
-  h5py==3.10.0 \
-  hydra-core==1.3.2 \
-  ipdb==0.13.13 \
-  lightning==2.2.1 \
-  notebook==7.1.1 \
-  nvitop==1.3.2 \
-  omegaconf==2.3.0 \
-  packaging==23.2 \
-  pandas==2.2.1 \
-  rich==13.7.1 \
-  seaborn==0.13.2 \
-  scikit-learn==1.4.0 \
-  transformers==4.38.2 \
-  triton==2.2.0 \
-  torch==2.3.1 \
-  torchaudio==2.3.1 \
-  torchmetrics==1.6.1 \
-  torchvision==0.18.1 \
-  wandb \
-  timm \
-  ocifs \
-  hf_transfer \
-  huggingface-hub
-```
-
-Optional, install FlashAttention after PyTorch is installed:
-
-```bash
-pip install flash_attn==2.7.4.post1 --no-build-isolation
-```
-
-> Note: `requirements.txt` currently acts more like a compact environment note than a standard pip requirements file. If you want `pip install -r requirements.txt` to work directly, place each package on its own uncommented line.
 
 ---
+## Checkpoints
+<a name="checkpoints"></a>
 
-## Quick start
-
-All experiments are driven by `main.py` and Hydra overrides.
-
-The main modes are:
-
-```text
-mode=train        # train / distill
-mode=ppl_eval     # validation perplexity evaluation
-mode=sample_eval  # generate samples and compute sample metrics
-```
+* **IDLM-MDLM**. Trained on OpenWebText:
+  * [Huggingface](https://huggingface.co/kekchpek/idlm-mdlm)🤗.
+* **IDLM-Duo**. Trained on OpenWebText:
+  * [Huggingface](https://huggingface.co/kekchpek/idlm-duo)🤗.
+* **IDLM-DCD**. Trained on OpenWebText:
+  * [Huggingface](https://huggingface.co/kekchpek/idlm-dcd)🤗.
 
 ---
 
 ## Train IDLM
 
-The repository includes three training recipes.
+The repository includes three training recipes. Before executing the scripts, configure the `cache_dir` parameter in `configs.data.openwebtext-split.yaml` to specify the desired output path.
 
 ### MDLM teacher → IDLM student
 
@@ -192,15 +141,18 @@ mkdir -p samples
 
 python -m main \
   mode=sample_eval \
+  loader.batch_size=2 \
+  loader.eval_batch_size=8 \
   data=openwebtext-split \
   algo=mdlm \
   algo.backbone=hf_dit \
   eval.checkpoint_path=kekchpek/idlm-mdlm \
-  sampling.steps=8 \
+  sampling.steps=16 \
   sampling.num_sample_batches=10 \
   sampling.predictor=ancestral_cache \
   sampling.noise_removal=ancestral \
-  eval.generated_samples_path=samples/idlm_mdlm_8steps.json
+  +wandb.offline=true \
+  eval.generated_samples_path=samples/idlm_mdlm_16steps.json
 ```
 
 ### DUO checkpoint
@@ -210,17 +162,40 @@ mkdir -p samples
 
 python -m main \
   mode=sample_eval \
+  loader.batch_size=2 \
+  loader.eval_batch_size=8 \
   data=openwebtext-split \
   algo=duo \
   algo.backbone=hf_dit \
   eval.checkpoint_path=kekchpek/idlm-duo \
-  sampling.steps=8 \
+  sampling.steps=16 \
   sampling.num_sample_batches=10 \
   sampling.noise_removal=greedy \
-  eval.generated_samples_path=samples/idlm_duo_8steps.json
+  +wandb.offline=true \
+  eval.generated_samples_path=samples/idlm_duo_16steps.json
 ```
 
-### Run the provided sweeps
+### DCD checkpoint
+
+```bash
+mkdir -p samples
+
+python -m main \
+  mode=sample_eval \
+  loader.batch_size=2 \
+  loader.eval_batch_size=8 \
+  data=openwebtext-split \
+  algo=duo \
+  algo.backbone=hf_dit \
+  eval.checkpoint_path=kekchpek/idlm-dcd \
+  sampling.steps=4 \
+  sampling.num_sample_batches=10 \
+  sampling.noise_removal=greedy \
+  +wandb.offline=true \
+  eval.generated_samples_path=samples/idlm_duo_4steps.json
+```
+
+### Run the provided scripts
 
 ```bash
 bash scripts/generation_idlm_mdlm.sh
@@ -236,61 +211,6 @@ Generated sample files contain:
   "entropy": 0.0,
   "generated_seqs": []
 }
-```
-
----
-
-## Evaluate perplexity
-
-```bash
-python -m main \
-  mode=ppl_eval \
-  data=openwebtext-split \
-  algo=mdlm \
-  algo.backbone=hf_dit \
-  eval.checkpoint_path=<path-or-hf-checkpoint> \
-  loader.eval_batch_size=8
-```
-
-Replace `<path-or-hf-checkpoint>` with a local checkpoint path or a Hugging Face checkpoint identifier.
-
----
-
-## Common Hydra overrides
-
-| Override | Purpose |
-| --- | --- |
-| `mode=train` | Train or distill a model |
-| `mode=sample_eval` | Generate samples |
-| `mode=ppl_eval` | Run validation evaluation |
-| `algo=mdlm` | Use MDLM |
-| `algo=duo` | Use DUO |
-| `algo=sedd` | Use SEDD |
-| `algo=d3pm` | Use D3PM absorbing-state diffusion |
-| `algo.backbone=hf_dit` | Use the Hugging Face DiT-style backbone |
-| `data=openwebtext-split` | Use the OpenWebText split config |
-| `model=small` | Use the small model config |
-| `model.length=1024` | Set sequence length |
-| `sampling.steps=8` | Set number of sampling steps |
-| `eval.checkpoint_path=...` | Load a checkpoint for eval / sampling |
-| `eval.generated_samples_path=...` | Save generated samples to JSON |
-| `adversarial_distill.is_distill=True` | Enable IDLM-style distillation |
-| `logger.name=...` | Name the TensorBoard run |
-
-Example:
-
-```bash
-python -m main \
-  mode=train \
-  data=openwebtext-split \
-  model=small \
-  algo=mdlm \
-  algo.backbone=hf_dit \
-  adversarial_distill.is_distill=True \
-  eval.checkpoint_path=kuleshov-group/mdlm-owt \
-  sampling.steps=32 \
-  optim.lr=1e-6 \
-  logger.name=idlm-mdlm
 ```
 
 ---
@@ -335,16 +255,6 @@ Checkpoints are written according to the checkpointing config in `configs/config
 
 ---
 
-## Tips
-
-- Reduce `loader.batch_size`, `loader.eval_batch_size`, or `model.length` if you run out of GPU memory.
-- Install FlashAttention only after PyTorch is installed.
-- For generation, always set `eval.generated_samples_path` to a file path, for example `samples/run.json`.
-- Use `trainer.devices=1` for a single-GPU run.
-- Use `trainer.limit_val_batches=0.01` for quick validation checks during debugging.
-
----
-
 ## Citation
 
 If you find this repository useful, please cite:
@@ -357,6 +267,12 @@ If you find this repository useful, please cite:
   year={2026}
 }
 ```
+
+---
+
+## Acknowledgements
+
+Our codebase is inspired by recent Discrete Diffusion Models projects. Namely, [MDLM](https://github.com/kuleshov-group/mdlm) and [Duo](https://github.com/s-sahoo/duo).
 
 ---
 
