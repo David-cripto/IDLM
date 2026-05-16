@@ -1,4 +1,4 @@
-# [IDLM: Inverse-distilled Diffusion Language Models (ICML 2026)](https://arxiv.org/abs/2602.19066)
+# [IDLM: Inverse-distilled Diffusion Language Models](https://arxiv.org/abs/2602.19066)
 
 <p align="center">
   <b>Few-step text generation from distilled diffusion.</b><br>
@@ -118,7 +118,7 @@ bash scripts/train_idlm_mdlm.sh
 bash scripts/train_idlm_duo.sh
 ```
 
-### DCD-style recipe
+### DCD teacher → IDLM student
 
 ```bash
 bash scripts/train_idlm_dcd.sh
