@@ -9,7 +9,7 @@
     <img src="https://img.shields.io/badge/arXiv-2602.19066-b31b1b.svg" alt="arXiv">
   </a>
   
-  <a href="https://huggingface.co/kekchpek">
+  <a href="https://huggingface.co/kekchpek/models">
     <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-ffcc4d.svg" alt="Hugging Face Models">
   </a>
   
