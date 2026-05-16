@@ -19,7 +19,7 @@
 </p>
 
 <div align="center">
-  <img src="https://github.com/David-cripto/IDLM/blob/main/assets/teaser.png" width="60%">
+  <img src="https://github.com/David-cripto/IDLM/blob/main/assets/teaser.png" width="70%">
 </div>
 
 
