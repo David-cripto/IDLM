@@ -106,19 +106,19 @@ pip install flash_attn==2.7.4.post1
 
 The repository includes three training recipes. Before executing the scripts, configure the `cache_dir` parameter in `configs.data.openwebtext-split.yaml` to specify the desired output path.
 
-### MDLM teacher → IDLM student
+### MDLM teacher → IDLM-MDLM student
 
 ```bash
 bash scripts/train_idlm_mdlm.sh
 ```
 
-### DUO teacher → IDLM student
+### DUO teacher → IDLM-Duo student
 
 ```bash
 bash scripts/train_idlm_duo.sh
 ```
 
-### DCD teacher → IDLM student
+### DCD teacher → IDLM-DCD student
 
 ```bash
 bash scripts/train_idlm_dcd.sh
