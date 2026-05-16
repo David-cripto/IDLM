@@ -134,7 +134,7 @@ The generation scripts sweep over 4, 8, 16, and 32 sampling steps.
 
 Before running them, set `eval.generated_samples_path` to a real JSON output path.
 
-### MDLM checkpoint
+### IDLM-MDLM checkpoint
 
 ```bash
 mkdir -p samples
@@ -155,7 +155,7 @@ python -m main \
   eval.generated_samples_path=samples/idlm_mdlm_16steps.json
 ```
 
-### DUO checkpoint
+### IDLM-Duo checkpoint
 
 ```bash
 mkdir -p samples
@@ -175,7 +175,7 @@ python -m main \
   eval.generated_samples_path=samples/idlm_duo_16steps.json
 ```
 
-### DCD checkpoint
+### IDLM-DCD checkpoint
 
 ```bash
 mkdir -p samples
