@@ -12,6 +12,10 @@
   <a href="https://huggingface.co/kekchpek/models">
     <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-ffcc4d.svg" alt="Hugging Face Models">
   </a>
+
+  <a href="https://www.youtube.com/watch?v=RZ6_huata1Y&amp;feature=youtu.be">
+    <img src="https://img.shields.io/badge/YouTube-Recording-red?logo=youtube&amp;logoColor=white" alt="YouTube Recording">
+  </a>
   
   <a href="./LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License">
