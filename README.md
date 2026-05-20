@@ -1,10 +1,22 @@
-# [IDLM: Inverse-distilled Diffusion Language Models](https://arxiv.org/abs/2602.19066)
+# [IDLM: Inverse-distilled Diffusion Language Models](https://david-cripto.github.io/idlm-project-page/)
 
 <p align="center">
-  <b>Few-step text generation from distilled diffusion.</b><br>
+  <strong>By</strong><br>
+  <a href="https://david-cripto.github.io/Bio-page/">David Li</a>*,
+  <a href="https://scholar.google.com/citations?hl=en&amp;oi=ao&amp;user=UaRTbNoAAAAJ">Nikita Gushchin</a>*,
+  <a href="https://scholar.google.com/citations?hl=en&amp;oi=ao&amp;user=h0oeoJkAAAAJ">Dmitry Abulkhanov</a>,
+  <a href="https://scholar.google.com/citations?hl=en&amp;oi=ao&amp;user=_XE1LvQAAAAJ">Eric Moulines</a>,
+  <a href="https://scholar.google.com/citations?hl=en&amp;oi=ao&amp;user=5kMqBQEAAAAJ">Ivan Oseledets</a>,
+  <a href="https://scholar.google.com/citations?hl=en&amp;oi=ao&amp;user=BqDhGJQAAAAJ">Maxim Panov</a>,
+  <a href="https://akorotin.netlify.app/">Alexander Korotin</a>
 </p>
 
+
 <p align="center">
+  <a href="https://david-cripto.github.io/idlm-project-page/">
+    <img src="https://img.shields.io/badge/Bio-Page-blue.svg" alt="Bio Page">
+  </a>
+  
   <a href="https://arxiv.org/abs/2602.19066">
     <img src="https://img.shields.io/badge/arXiv-2602.19066-b31b1b.svg" alt="arXiv">
   </a>
