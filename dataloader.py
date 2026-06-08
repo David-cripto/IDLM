@@ -268,6 +268,172 @@ class Text8Tokenizer(transformers.PreTrainedTokenizer):
     return self._vocab_str_to_int
 
 
+def get_tiny_gsm_dataset(config, tokenizer):
+  """Download, tokenize, and split TinyGSM.
+
+  Examples are encoded as:
+    [BOS] question separator answer [EOS]
+
+  The attention mask controls which tokens contribute to the loss. For IDLM
+  distillation on TinyGSM we train on answer tokens and padding, but not on the
+  prompt tokens.
+  """
+  mask_tag = 'full' if config.data.train_on_prompt else 'answer_only'
+  filter_tag = '_filtered' if config.data.filter_too_long else ''
+  wrap_tag = '_wrapped' if config.data.wrap else ''
+  pad_tag = '_train_on_pad' if config.data.train_on_pad else ''
+  tokenizer_tag = config.data.tokenizer_name_or_path.replace('/', '__')
+  dataset_tag = config.data.train
+  save_dir = (f'{config.data.cache_dir}/{dataset_tag}_bs{config.model.length}'
+              f'_{mask_tag}{filter_tag}{wrap_tag}{pad_tag}_{tokenizer_tag}')
+  split_names = ['train', 'validation']
+
+  if all(utils.fsspec_exists(os.path.join(save_dir, split))
+         for split in split_names):
+    return datasets.load_from_disk(save_dir)
+
+  data_path = getattr(config.data, 'data_path', None)
+  if data_path:
+    LOGGER.info(f'Preparing TinyGSM-style dataset from {data_path}.')
+    with open(data_path) as f:
+      records = json.load(f)
+    normalized_records = []
+    for record in records:
+      question = record.get('question') or record.get('prompt')
+      answer = (record.get('code')
+                or record.get('response_ground_truth')
+                or record.get('answer'))
+      if question is None or answer is None:
+        raise ValueError(
+          'TinyGSM-style local records require question/code, '
+          'prompt/response_ground_truth, or question/answer fields.')
+      normalized_records.append({'question': question, 'code': answer})
+    ds = datasets.Dataset.from_list(normalized_records)
+  else:
+    LOGGER.info('Preparing TinyGSM dataset.')
+    ds = datasets.load_dataset(
+      'TinyGSM/TinyGSM', split='train',
+      cache_dir=config.data.cache_dir)
+
+  eos = tokenizer.eos_token_id
+  bos = tokenizer.bos_token_id
+  pad = tokenizer.pad_token_id
+  sep_ids = tokenizer(
+    config.data.separator, add_special_tokens=False).input_ids
+  block_size = config.model.length
+  train_on_prompt = config.data.train_on_prompt
+
+  def tokenize_qa(example):
+    q_ids = tokenizer(
+      example['question'].strip(),
+      add_special_tokens=False).input_ids
+    a_ids = tokenizer(
+      example['code'].strip(),
+      add_special_tokens=False).input_ids
+    ids = [bos] + q_ids + sep_ids + a_ids + [eos]
+    prompt_len = 1 + len(q_ids) + len(sep_ids)
+    return {'input_ids': ids, 'prompt_len': prompt_len}
+
+  tokenized = ds.map(
+    tokenize_qa,
+    num_proc=config.loader.num_workers,
+    remove_columns=ds.column_names,
+    desc='Tokenizing TinyGSM')
+
+  if config.data.filter_too_long:
+    if config.data.wrap:
+      raise ValueError('TinyGSM filter_too_long requires wrap=False.')
+    before = len(tokenized)
+    tokenized = tokenized.filter(
+      lambda x: len(x['input_ids']) <= block_size,
+      num_proc=config.loader.num_workers,
+      desc='Filtering too-long TinyGSM examples')
+    LOGGER.info(
+      f'Filtered TinyGSM: {before} -> {len(tokenized)} '
+      f'({before - len(tokenized)} removed)')
+
+  if config.data.wrap:
+    tokenized = tokenized.remove_columns('prompt_len')
+
+    def wrap_batch(examples):
+      all_ids = list(itertools.chain.from_iterable(examples['input_ids']))
+      total = (len(all_ids) // block_size) * block_size
+      chunks = [all_ids[i:i + block_size]
+                for i in range(0, total, block_size)]
+      masks = [[1] * block_size] * len(chunks)
+      return {'input_ids': chunks, 'attention_mask': masks}
+
+    tokenized = tokenized.map(
+      wrap_batch,
+      batched=True,
+      batch_size=1000,
+      num_proc=config.loader.num_workers,
+      remove_columns=tokenized.column_names,
+      desc='Wrapping TinyGSM')
+  else:
+    def pad_and_mask(example):
+      ids = example['input_ids']
+      n = len(ids)
+      prompt_len = example['prompt_len']
+      if n >= block_size:
+        ids = ids[:block_size - 1] + [eos]
+      else:
+        ids = ids + [pad] * (block_size - n)
+      mask_start = 0 if train_on_prompt else min(prompt_len, block_size)
+      mask_end = block_size if config.data.train_on_pad else min(n, block_size)
+      mask = ([0] * mask_start
+              + [1] * (mask_end - mask_start)
+              + [0] * (block_size - mask_end))
+      return {'input_ids': ids, 'attention_mask': mask}
+
+    tokenized = tokenized.map(
+      pad_and_mask,
+      num_proc=config.loader.num_workers,
+      desc='Padding TinyGSM')
+
+  tmp = tokenized.train_test_split(
+    test_size=config.data.val_ratio,
+    seed=config.data.val_seed)
+  dataset = datasets.DatasetDict({
+    'train': tmp['train'],
+    'validation': tmp['test']})
+  dataset.save_to_disk(save_dir)
+  return dataset
+
+
+def get_gsm8k_test_dataset(config, tokenizer):
+  """Load and tokenize the local GSM8K/TinyGSM test set for conditional eval."""
+  tokenizer_tag = config.data.tokenizer_name_or_path.replace('/', '__')
+  save_dir = f'{config.data.cache_dir}/gsm8k_test_{tokenizer_tag}_with_text'
+
+  if utils.fsspec_exists(save_dir):
+    LOGGER.info(f'Loading GSM8K test from cache: {save_dir}')
+    return datasets.load_from_disk(save_dir)
+
+  LOGGER.info(f'Preparing GSM8K test dataset from {config.data.data_path}')
+  with open(config.data.data_path) as f:
+    records = json.load(f)
+
+  bos = tokenizer.bos_token_id
+  sep_ids = tokenizer(
+    config.data.separator, add_special_tokens=False).input_ids
+
+  def tokenize_example(example):
+    q_ids = tokenizer(
+      example['prompt'].strip(), add_special_tokens=False).input_ids
+    a_ids = tokenizer(
+      example['response_ground_truth'].strip(),
+      add_special_tokens=False).input_ids
+    prompt = [bos] + q_ids + sep_ids
+    return {'input_ids': prompt, 'answer': a_ids}
+
+  dataset = datasets.Dataset.from_list(records).map(
+    tokenize_example,
+    desc='Tokenizing GSM8K test')
+  dataset.save_to_disk(save_dir)
+  return dataset
+
+
 def get_lambada_test_dataset():
     url = "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl"
 
@@ -420,7 +586,8 @@ def get_dataset(dataset_name,
                 block_size=1024,
                 num_proc=len(os.sched_getaffinity(0)),
                 streaming=False,
-                revision : Optional[str]=None):
+                revision : Optional[str]=None,
+                config=None):
   eos_tag = ''
   if not insert_eos:
     eos_tag = '_eosFalse'
@@ -469,6 +636,14 @@ def get_dataset(dataset_name,
     assert revision is None
     dataset = get_text8_dataset(
       cache_dir, max_seq_length=block_size, crop_train=True)
+  elif dataset_name == 'tiny_gsm':
+    if config is None:
+      raise ValueError('TinyGSM dataset requires the full config.')
+    dataset = get_tiny_gsm_dataset(config, tokenizer)
+  elif dataset_name == 'gsm8k_test':
+    if config is None:
+      raise ValueError('GSM8K test dataset requires the full config.')
+    return get_gsm8k_test_dataset(config, tokenizer)
   elif dataset_name == 'openwebtext-train':
     dataset = datasets.load_dataset(
       'openwebtext',
@@ -524,9 +699,9 @@ def get_dataset(dataset_name,
     data = dataset
   else:
     data = dataset[mode]
-    if dataset_name == 'synthetic':
+    if dataset_name in ('synthetic', 'tiny_gsm'):
       # already tokenized, no further actions required
-      return data
+      return data.with_format('torch')
 
   if dataset_name.startswith('wikitext'):
     detokenizer = wt_detokenizer
@@ -631,6 +806,40 @@ def get_dataset(dataset_name,
   return chunked_dataset
 
 
+class VocabSizeTokenizerWrapper:
+  """Expose len(tokenizer) as vocab_size for tokenizers with added tokens."""
+
+  def __init__(self, tokenizer):
+    object.__setattr__(self, '_tokenizer', tokenizer)
+
+  def _wrapped(self):
+    return object.__getattribute__(self, '_tokenizer')
+
+  @property
+  def vocab_size(self):
+    return len(self._wrapped())
+
+  def __len__(self):
+    return len(self._wrapped())
+
+  def __call__(self, *args, **kwargs):
+    return self._wrapped()(*args, **kwargs)
+
+  def __getattr__(self, name):
+    if name == '_tokenizer':
+      raise AttributeError(name)
+    return getattr(self._wrapped(), name)
+
+  def __setattr__(self, name, value):
+    if name == '_tokenizer':
+      object.__setattr__(self, name, value)
+    else:
+      setattr(self._wrapped(), name, value)
+
+  def __repr__(self):
+    return f'Wrapped<{self._wrapped()}>'
+
+
 def get_tokenizer(config):
   if config.data.tokenizer_name_or_path == 'text8':
     tokenizer = Text8Tokenizer()
@@ -653,11 +862,14 @@ def get_tokenizer(config):
   #  [BOS] sent1 [EOS] sent2-fragment [EOS]
   #  [BOS] sent2-fragment [EOS] sent3 [EOS]
   if tokenizer.bos_token is None:
-    if tokenizer.cls_token is None:
+    if tokenizer.cls_token is not None:
+      tokenizer.bos_token = tokenizer.cls_token
+    elif tokenizer.eos_token is not None:
+      tokenizer.bos_token = tokenizer.eos_token
+    else:
       raise AttributeError(
-        'Tokenizer must have a bos_token or '
-        f'cls_token: {tokenizer}')
-    tokenizer.bos_token = tokenizer.cls_token
+        'Tokenizer must have a bos_token, cls_token, '
+        f'or eos_token: {tokenizer}')
   if tokenizer.eos_token is None:
     if tokenizer.sep_token is None:
       raise AttributeError(
@@ -666,6 +878,15 @@ def get_tokenizer(config):
     tokenizer.eos_token = tokenizer.sep_token
   if tokenizer.pad_token is None:
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+
+  if getattr(tokenizer, 'mask_token_id', None) in {
+      tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}:
+    tokenizer.mask_token = None
+
+  wrap_tokenizer = config.data.tokenizer_name_or_path not in (
+    'gpt2', 'bert-base-uncased', 'synthetic', 'text8')
+  if wrap_tokenizer:
+    tokenizer = VocabSizeTokenizerWrapper(tokenizer)
 
   return tokenizer
     
@@ -685,7 +906,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       block_size=config.model.length,
       streaming=config.data.streaming,
       num_proc=config.loader.num_workers,
-      revision=config.data.get("train_revision", None))
+      revision=config.data.get("train_revision", None),
+      config=config)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -704,7 +926,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       block_size=config.model.length,
       streaming=config.data.streaming,
       num_proc=config.loader.num_workers,
-      revision=config.data.get("valid_revision", None))
+      revision=config.data.get("valid_revision", None),
+      config=config)
 
   if skip_train:
     train_loader = None

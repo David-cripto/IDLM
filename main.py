@@ -26,6 +26,38 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
+class PeriodicStepCheckpoint(L.Callback):
+  """Save deterministic checkpoints every N completed train batches."""
+
+  def __init__(self, dirpath, every_n_train_steps):
+    self.dirpath = os.fspath(dirpath)
+    self.every_n_train_steps = int(every_n_train_steps)
+    self._completed_train_batches = 0
+    self._last_saved_step = 0
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.every_n_train_steps <= 0:
+      return
+
+    self._completed_train_batches += 1
+    save_step = (
+      self._completed_train_batches // self.every_n_train_steps
+    ) * self.every_n_train_steps
+    if save_step <= 0 or save_step <= self._last_saved_step:
+      return
+
+    os.makedirs(self.dirpath, exist_ok=True)
+    ckpt_path = os.path.join(self.dirpath, f'step={save_step:08d}.ckpt')
+    # All DDP ranks must enter save_checkpoint because Lightning synchronizes
+    # inside the strategy; only rank zero writes the file.
+    trainer.save_checkpoint(ckpt_path)
+    self._last_saved_step = save_step
+    if trainer.is_global_zero:
+      print(
+        f'Saved periodic checkpoint at train_batch={save_step}: {ckpt_path}',
+        flush=True)
+
+
 def _load_from_checkpoint(diffusion_model, config, tokenizer):
   if 'hf' in config.algo.backbone:
     model = diffusion_model(config, tokenizer=tokenizer).to('cuda')
@@ -190,6 +222,10 @@ def _train(diffusion_model, config, logger, tokenizer):
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
       callbacks.append(hydra.utils.instantiate(callback))
+    if config.checkpointing.get('use_periodic_train_batch_checkpoint', False):
+      callbacks.append(PeriodicStepCheckpoint(
+        os.path.join(os.fspath(config.checkpointing.save_dir), 'checkpoints'),
+        config.callbacks.checkpoint_every_n_steps.every_n_train_steps))
 
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer)
