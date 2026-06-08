@@ -17,7 +17,7 @@ python -u -m main \
   training.loss_precision=float32 \
   logger.name=idlm-mdlm \
   sampling.steps=32 \
-  sampling.predictor='ancestral' \
+  sampling.predictor='ancestral_cache' \
   optim.lr=1e-6 \
   trainer.val_check_interval=1500 \
   trainer.limit_val_batches=0.01 

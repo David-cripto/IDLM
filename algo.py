@@ -20,6 +20,12 @@ def _maybe_save_periodic_checkpoint(module):
   return
 
 
+def _conditional_valid_tokens(config, valid_tokens):
+  if getattr(config.data, 'train', None) == 'tiny_gsm':
+    return valid_tokens
+  return None
+
+
 def _apply_top_p_mask(log_probs: torch.Tensor, top_p: float, neg_infinity: float):
     """
     log_probs: (B, V) log-probabilities (already log_softmax'd)
@@ -327,6 +333,7 @@ class MDLM(trainer_base.AbsorbingState):
 
       (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
                                                                               batch['attention_mask'])
+      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
         g_loss = self.generator_loss(input_tokens, valid_tokens, current_accumulation_step)
@@ -824,7 +831,7 @@ class DUO(DUO_BASE):
 
   def _masked_mean(self, loss, valid_tokens):
     if valid_tokens is None:
-      return loss.mean()
+      return loss.sum(-1).mean()
     return (loss * valid_tokens).sum() / valid_tokens.sum().clamp(min=1)
 
   def multistep_generation(self, x0, current_accumulation_step,
@@ -1079,6 +1086,7 @@ class DUO(DUO_BASE):
 
       (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
                                                                               batch['attention_mask'])
+      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
         g_loss = self.generator_loss(
