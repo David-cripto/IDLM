@@ -15,6 +15,17 @@ import models
 from ipdb import set_trace as debug
 
 
+def _maybe_save_periodic_checkpoint(module):
+  # Periodic checkpointing is handled by main.PeriodicStepCheckpoint.
+  return
+
+
+def _conditional_valid_tokens(config, valid_tokens):
+  if getattr(config.data, 'train', None) == 'tiny_gsm':
+    return valid_tokens
+  return None
+
+
 def _apply_top_p_mask(log_probs: torch.Tensor, top_p: float, neg_infinity: float):
     """
     log_probs: (B, V) log-probabilities (already log_softmax'd)
@@ -68,8 +79,9 @@ class AR(trainer_base.TrainerBase):
     return input_tokens, output_tokens, valid_tokens
 
   def nll(self, input_tokens, output_tokens,
-          current_accumulation_step):
-    del current_accumulation_step
+          current_accumulation_step, train_mode=None,
+          valid_tokens=None):
+    del current_accumulation_step, train_mode, valid_tokens
     output = self.backbone(input_tokens, None)
     output[:, :, self.mask_index] = self.neg_infinity
     output = output.log_softmax(-1)
@@ -191,37 +203,77 @@ class MDLM(trainer_base.AbsorbingState):
     return model_output
 
   def on_train_start(self):
-    self.ema_fake.move_shadow_params_to_device(self.device)
-    utils.activate_model(self.fake_model)
-    utils.freeze_model(self.backbone)
+    if self.is_adversarial_distill:
+      self.ema_fake.move_shadow_params_to_device(self.device)
+      utils.activate_model(self.fake_model)
+      utils.freeze_model(self.backbone)
     super().on_train_start()
 
-  def multistep_generation(self, x0, current_accumulation_step):
+  def on_load_checkpoint(self, checkpoint):
+    if self.is_adversarial_distill:
+      state_dict = collections.OrderedDict(checkpoint['state_dict'])
+      for key, value in list(state_dict.items()):
+        if key.startswith('backbone.'):
+          suffix = key[len('backbone.'):]
+          state_dict.setdefault(f'teacher.{suffix}', value)
+          state_dict.setdefault(f'fake_model.{suffix}', value)
+      checkpoint['state_dict'] = state_dict
+    super().on_load_checkpoint(checkpoint)
+    if self.is_adversarial_distill and self.ema_fake is not None:
+      ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
+      if ema_fake_state is not None:
+        self.ema_fake.load_state_dict(ema_fake_state)
+
+  def on_save_checkpoint(self, checkpoint):
+    super().on_save_checkpoint(checkpoint)
+    if self.is_adversarial_distill and self.ema_fake is not None:
+      checkpoint['ema_fake'] = self.ema_fake.state_dict()
+
+  def _preserve_prompt_probs(self, probs, x0, valid_tokens):
+    if valid_tokens is None:
+      return probs
+    clean_probs = F.one_hot(x0, num_classes=probs.shape[-1]).to(probs.dtype)
+    return torch.where(valid_tokens[..., None].bool(), probs, clean_probs)
+
+  def _preserve_prompt_tokens(self, tokens, x0, valid_tokens):
+    if valid_tokens is None:
+      return tokens
+    return torch.where(valid_tokens.bool(), tokens, x0)
+
+  def multistep_generation(self, x0, valid_tokens, current_accumulation_step):
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
     alpha_t = alpha_t.unsqueeze(-1)
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self.q_xt(x0, alpha_t)
-    
-    log_x_theta = self.forward(xt, sigma=sigma)
-    return log_x_theta.exp()
+    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
 
-  def q_xt_with_probs(self, student_probs, alpha_t):
+    log_x_theta = self.forward(xt, sigma=sigma)
+    student_probs = log_x_theta.exp()
+    return self._preserve_prompt_probs(student_probs, x0, valid_tokens)
+
+  def q_xt_with_probs(self, student_probs, alpha_t, x0=None, valid_tokens=None):
     mask_probs = torch.zeros_like(student_probs)
     mask_probs[:, :, self.mask_index] = 1
     noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(mask_probs)
+    if x0 is not None and valid_tokens is not None:
+      noise_probs = self._preserve_prompt_probs(noise_probs, x0, valid_tokens)
     return noise_probs
 
   def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t,
-                    dalpha_t, low_var=False):
+                    dalpha_t, low_var=False, valid_tokens=None):
     del xt
     loss = (x0 * log_x_theta).sum(-1)
-    return (loss * dalpha_t / (1 - alpha_t)).sum(-1)
+    loss = loss * dalpha_t / (1 - alpha_t)
+    if valid_tokens is not None:
+      loss = loss * valid_tokens
+      denom = valid_tokens.sum(-1).clamp_min(1)
+      return loss.sum(-1) / denom
+    return loss.sum(-1)
 
-  def generator_loss(self, x0, current_accumulation_step):
-    student_probs = self.multistep_generation(x0, current_accumulation_step)
+  def generator_loss(self, x0, valid_tokens, current_accumulation_step):
+    student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
     
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
@@ -230,25 +282,28 @@ class MDLM(trainer_base.AbsorbingState):
     sigma = self._sigma_from_alphat(alpha_t)
     sigma = self._process_sigma(sigma)
 
-    probs_xt = self.q_xt_with_probs(student_probs, alpha_t)
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
     xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
     
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_teacher = self.teacher(xt, sigma)
     logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
     teacher_loss = self.nll_per_token_with_probs(logits_teacher, xt, student_probs, 
-                                alpha_t=alpha_t, dalpha_t=dalpha_t)
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
-                                alpha_t=alpha_t, dalpha_t=dalpha_t)
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
     return teacher_loss - fake_loss
 
-  def fake_loss(self, x0, current_accumulation_step):
+  def fake_loss(self, x0, valid_tokens, current_accumulation_step):
     with torch.no_grad():
-      student_probs = self.multistep_generation(x0, current_accumulation_step)
+      student_probs = self.multistep_generation(x0, valid_tokens, current_accumulation_step)
 
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dalpha_t, alpha_t = self.noise(t)
@@ -256,14 +311,16 @@ class MDLM(trainer_base.AbsorbingState):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
     sigma = self._process_sigma(sigma)
-    probs_xt = self.q_xt_with_probs(student_probs, alpha_t)
+    probs_xt = self.q_xt_with_probs(student_probs, alpha_t, x0=x0, valid_tokens=valid_tokens)
     xt = trainer_base.sample_categorical(probs_xt)
+    xt = self._preserve_prompt_tokens(xt, x0, valid_tokens)
 
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt, student_probs, 
-                                alpha_t=alpha_t, dalpha_t=dalpha_t)
+                                alpha_t=alpha_t, dalpha_t=dalpha_t,
+                                valid_tokens=valid_tokens)
 
     return fake_loss
 
@@ -276,9 +333,10 @@ class MDLM(trainer_base.AbsorbingState):
 
       (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
                                                                               batch['attention_mask'])
+      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
-        g_loss = self.generator_loss(input_tokens, current_accumulation_step)
+        g_loss = self.generator_loss(input_tokens, valid_tokens, current_accumulation_step)
         g_loss = g_loss.mean()
         g_loss = g_loss / self.accum_batches
         self.manual_backward(g_loss)
@@ -295,7 +353,7 @@ class MDLM(trainer_base.AbsorbingState):
           finish_iter = True
       else:
         self.toggle_optimizer(optimizer_fake)
-        f_loss = self.fake_loss(input_tokens, current_accumulation_step)
+        f_loss = self.fake_loss(input_tokens, valid_tokens, current_accumulation_step)
         f_loss = f_loss.mean()
         f_loss = f_loss / self.accum_batches
         self.manual_backward(f_loss)
@@ -309,6 +367,9 @@ class MDLM(trainer_base.AbsorbingState):
           self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()
           finish_iter = True
+
+      if finish_iter:
+        _maybe_save_periodic_checkpoint(self)
 
       if finish_iter and self.is_generator_step:
         self.is_generator_step = False
@@ -745,15 +806,43 @@ class DUO(DUO_BASE):
     xt = self._q_xt_gaussian(x0_one_hot, gamma_t_mdt)
     return xt
 
-  
-  def multistep_generation(self, x0, current_accumulation_step, eps_probs=1e-12):
+  def _clean_probs(self, x0):
+    return F.one_hot(x0, self.vocab_size).to(self.dtype)
+
+  def _force_prompt_probs(self, probs, clean_probs, valid_tokens):
+    if valid_tokens is None:
+      return probs
+    prompt = ~valid_tokens.bool().unsqueeze(-1)
+    return torch.where(prompt, clean_probs, probs)
+
+  def _scale_and_restore_prompt(self, xt, clean_probs, valid_tokens):
+    tau_inv = self._compute_gumbel_tau_inverse()
+    xt = xt * tau_inv
+    if valid_tokens is not None:
+      prompt = ~valid_tokens.bool().unsqueeze(-1)
+      xt = torch.where(prompt, clean_probs * tau_inv, xt)
+    return xt
+
+  def _argmax_with_clean_prompt(self, xt, x0, valid_tokens):
+    xt_tokens = xt.argmax(-1)
+    if valid_tokens is not None:
+      xt_tokens = torch.where(valid_tokens.bool(), xt_tokens, x0)
+    return xt_tokens
+
+  def _masked_mean(self, loss, valid_tokens):
+    if valid_tokens is None:
+      return loss.sum(-1).mean()
+    return (loss * valid_tokens).sum() / valid_tokens.sum().clamp(min=1)
+
+  def multistep_generation(self, x0, current_accumulation_step,
+                           valid_tokens=None, eps_probs=1e-12):
     t = self._sample_t(x0.shape[0], current_accumulation_step)
 
     gamma_t = self.gamma_min + t * (self.gamma_max - self.gamma_min)  
 
-    x0_one_hot = F.one_hot(x0, self.vocab_size)  
+    x0_one_hot = self._clean_probs(x0)
     xt = self._q_xt_gaussian(x0_one_hot, gamma_t)
-    xt = xt * self._compute_gumbel_tau_inverse()
+    xt = self._scale_and_restore_prompt(xt, x0_one_hot, valid_tokens)
 
     usdm_alpha_t = self._gamma_to_alphat(gamma_t)
     usdm_alpha_t = usdm_alpha_t.unsqueeze(-1)
@@ -761,7 +850,8 @@ class DUO(DUO_BASE):
     sigma = self._sigma_from_alphat(usdm_alpha_t)
     
     log_x_theta = self.forward(xt, sigma=sigma)
-    return log_x_theta.exp()
+    student_probs = log_x_theta.exp()
+    return self._force_prompt_probs(student_probs, x0_one_hot, valid_tokens)
 
   def nll_per_token_with_probs(self, log_x_theta, xt, x0, alpha_t, dalpha_t):
     assert alpha_t.ndim == 2
@@ -787,9 +877,9 @@ class DUO(DUO_BASE):
       )
     
     term2 = term2.sum(dim=-1, keepdim=True)
-    diffusion_loss = (coeff.unsqueeze(-1) * (term1 - term2)).squeeze()  # B, L
+    diffusion_loss = (coeff.unsqueeze(-1) * (term1 - term2)).squeeze(-1)
     assert diffusion_loss.ndim == 2
-    return diffusion_loss.sum(-1)
+    return diffusion_loss
 
   def q_xt_with_probs(self, student_probs, alpha_t):
     noise_probs = alpha_t[:, :, None] * student_probs + (1 - alpha_t[:, :, None])*(1/self.vocab_size)
@@ -807,8 +897,12 @@ class DUO(DUO_BASE):
 
     return log_y_soft
 
-  def generator_loss(self, x0, current_accumulation_step):
-    student_probs = self.multistep_generation(x0, current_accumulation_step)
+  def generator_loss(self, x0, current_accumulation_step, valid_tokens=None):
+    student_probs = self.multistep_generation(
+      x0, current_accumulation_step, valid_tokens)
+    clean_probs = self._clean_probs(x0)
+    student_probs = self._force_prompt_probs(
+      student_probs, clean_probs, valid_tokens)
 
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     gamma_t = self.gamma_min + t * (self.gamma_max - self.gamma_min)   
@@ -823,8 +917,8 @@ class DUO(DUO_BASE):
     sigma = self._process_sigma(sigma)
 
     xt = self._q_xt_gaussian(student_probs, gamma_t)
-    xt = xt * self._compute_gumbel_tau_inverse()
-    xt_usdm = xt.argmax(-1)
+    xt = self._scale_and_restore_prompt(xt, clean_probs, valid_tokens)
+    xt_usdm = self._argmax_with_clean_prompt(xt, x0, valid_tokens)
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_teacher = self.teacher(xt, sigma)
     logits_teacher = self._process_model_output(model_output=model_output_teacher, xt=xt, sigma=sigma)
@@ -836,7 +930,7 @@ class DUO(DUO_BASE):
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt_usdm, student_probs, 
                                 alpha_t=usdm_alpha_t, dalpha_t=usdm_dalpha_t)
-    return teacher_loss - fake_loss
+    return self._masked_mean(teacher_loss - fake_loss, valid_tokens)
   
   def configure_optimizers(self):
     if self.config.adversarial_distill.is_distill:
@@ -867,9 +961,13 @@ class DUO(DUO_BASE):
     else:
       return super().configure_optimizers()
 
-  def fake_loss(self, x0, current_accumulation_step):
+  def fake_loss(self, x0, current_accumulation_step, valid_tokens=None):
     with torch.no_grad():
-      student_probs = self.multistep_generation(x0, current_accumulation_step)
+      student_probs = self.multistep_generation(
+        x0, current_accumulation_step, valid_tokens)
+    clean_probs = self._clean_probs(x0)
+    student_probs = self._force_prompt_probs(
+      student_probs, clean_probs, valid_tokens)
 
     t = self._sample_t(x0.shape[0], current_accumulation_step)
 
@@ -885,20 +983,94 @@ class DUO(DUO_BASE):
     sigma = self._process_sigma(sigma)
 
     xt = self._q_xt_gaussian(student_probs, gamma_t)
-    xt = xt * self._compute_gumbel_tau_inverse()
-    xt_usdm = xt.argmax(-1)
+    xt = self._scale_and_restore_prompt(xt, clean_probs, valid_tokens)
+    xt_usdm = self._argmax_with_clean_prompt(xt, x0, valid_tokens)
     with torch.cuda.amp.autocast(dtype=torch.float32):
       model_output_fake = self.fake_model(xt, sigma)
     logits_fake = self._process_model_output(model_output=model_output_fake, xt=xt, sigma=sigma)
     fake_loss = self.nll_per_token_with_probs(logits_fake, xt_usdm, student_probs, 
                                 alpha_t=usdm_alpha_t, dalpha_t=usdm_dalpha_t)
-    return fake_loss
+    return self._masked_mean(fake_loss, valid_tokens)
+
+  def _apply_checkpoint_ema_to_backbone_state(self, state_dict, checkpoint):
+    ema_state = checkpoint.get('ema', None)
+    if not (ema_state and 'shadow_params' in ema_state):
+      return
+    for (name, _), shadow in zip(
+        self.backbone.named_parameters(), ema_state['shadow_params']):
+      key = f'backbone.{name}'
+      if key in state_dict:
+        state_dict[key] = shadow.detach().clone().to(state_dict[key].dtype)
+
+  def _backbone_shadow_params_from_state(self, state_dict):
+    shadow_params = []
+    for name, _ in self.backbone.named_parameters():
+      key = f'backbone.{name}'
+      if key not in state_dict:
+        return None
+      shadow_params.append(state_dict[key].detach().clone())
+    return shadow_params
+
+  def _reset_distill_ema(self, shadow_params):
+    if shadow_params is None:
+      return
+    ema_state = {
+      'decay': self.config.training.ema,
+      'num_updates': 0,
+      'shadow_params': shadow_params,
+    }
+    if self.ema is not None:
+      self.ema.load_state_dict(copy.deepcopy(ema_state))
+    if getattr(self, 'ema_fake', None) is not None:
+      self.ema_fake.load_state_dict(copy.deepcopy(ema_state))
 
   def on_train_start(self):
-    self.ema_fake.move_shadow_params_to_device(self.device)
-    utils.activate_model(self.fake_model)
-    utils.freeze_model(self.backbone)
+    if self.is_adversarial_distill:
+      self.ema_fake.move_shadow_params_to_device(self.device)
+      utils.activate_model(self.fake_model)
+      utils.freeze_model(self.backbone)
     super().on_train_start()
+
+  def on_load_checkpoint(self, checkpoint):
+    state_dict = collections.OrderedDict(checkpoint['state_dict'])
+    has_distill_state = any(
+      key.startswith(('teacher.', 'fake_model.'))
+      for key in state_dict)
+    if self.is_adversarial_distill:
+      if not has_distill_state:
+        self._apply_checkpoint_ema_to_backbone_state(state_dict, checkpoint)
+      for key, value in list(state_dict.items()):
+        if key.startswith('backbone.'):
+          suffix = key[len('backbone.'):]
+          state_dict.setdefault(f'teacher.{suffix}', value)
+          state_dict.setdefault(f'fake_model.{suffix}', value)
+    else:
+      state_dict = collections.OrderedDict(
+        (k, v) for k, v in state_dict.items()
+        if not k.startswith(('teacher.', 'fake_model.')))
+    checkpoint['state_dict'] = state_dict
+    if self.is_adversarial_distill and not has_distill_state:
+      self._reset_distill_ema(
+        self._backbone_shadow_params_from_state(state_dict))
+      return
+    trainer_base.TrainerBase.on_load_checkpoint(self, checkpoint)
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
+      ema_fake_state = checkpoint.get('ema_fake', checkpoint.get('ema'))
+      if ema_fake_state is not None:
+        self.ema_fake.load_state_dict(ema_fake_state)
+
+  def on_save_checkpoint(self, checkpoint):
+    if self.is_adversarial_distill:
+      checkpoint['state_dict'] = collections.OrderedDict(
+        (k, v) for k, v in checkpoint['state_dict'].items()
+        if not k.startswith('teacher.'))
+      trainer_base.TrainerBase.on_save_checkpoint(self, checkpoint)
+    else:
+      super().on_save_checkpoint(checkpoint)
+    if (self.is_adversarial_distill
+        and getattr(self, 'ema_fake', None) is not None):
+      checkpoint['ema_fake'] = self.ema_fake.state_dict()
 
   def training_step(self, batch, batch_idx):
     self.log(name='gumbel_tau_log10',
@@ -914,9 +1086,11 @@ class DUO(DUO_BASE):
 
       (input_tokens, output_tokens, valid_tokens) = self._process_model_input(batch['input_ids'], 
                                                                               batch['attention_mask'])
+      valid_tokens = _conditional_valid_tokens(self.config, valid_tokens)
       if self.is_generator_step:
         self.toggle_optimizer(optimizer_student)
-        g_loss = self.generator_loss(input_tokens, current_accumulation_step)
+        g_loss = self.generator_loss(
+          input_tokens, current_accumulation_step, valid_tokens)
         g_loss = g_loss.mean()
         g_loss = g_loss / self.accum_batches
         self.manual_backward(g_loss)
@@ -933,7 +1107,8 @@ class DUO(DUO_BASE):
           finish_iter = True
       else:
         self.toggle_optimizer(optimizer_fake)
-        f_loss = self.fake_loss(input_tokens, current_accumulation_step)
+        f_loss = self.fake_loss(
+          input_tokens, current_accumulation_step, valid_tokens)
         f_loss = f_loss.mean()
         f_loss = f_loss / self.accum_batches
         self.manual_backward(f_loss)
@@ -947,6 +1122,9 @@ class DUO(DUO_BASE):
           self.ema_fake.update(self.fake_model.parameters())
           optimizer_fake.zero_grad()
           finish_iter = True
+
+      if finish_iter:
+        _maybe_save_periodic_checkpoint(self)
 
       if finish_iter and self.is_generator_step:
         self.is_generator_step = False
@@ -1003,12 +1181,14 @@ class DUO(DUO_BASE):
     return alpha_t * x + sigma_t * epsilon
 
   def nll(self, x0, output_tokens,
-          current_accumulation_step=None, train_mode=False):
+          current_accumulation_step=None, train_mode=False,
+          valid_tokens=None):
     use_true_nll = (self.global_step > self.curriculum_end
                     or not train_mode)
     if use_true_nll:
       return super().nll(x0, output_tokens,
-                         current_accumulation_step)
+                         current_accumulation_step,
+                         valid_tokens=valid_tokens)
     del output_tokens
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     gamma_t = self.gamma_min + t * (self.gamma_max
@@ -1115,7 +1295,8 @@ class Distillation(DUO):
     return 2 ** n / self.T
 
   def nll(self, x0, output_tokens,
-          current_accumulation_step=None, train_mode=None):
+          current_accumulation_step=None, train_mode=None,
+          valid_tokens=None):
     del output_tokens, train_mode
     t = self._sample_t(x0.shape[0], current_accumulation_step)
     dt = self._compute_dt()

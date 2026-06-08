@@ -368,7 +368,8 @@ class TrainerBase(L.LightningModule):
     raise NotImplementedError
 
   def nll(self, input_tokens, output_tokens,
-          current_accumulation_step=None, train_mode=False):
+          current_accumulation_step=None, train_mode=False,
+          valid_tokens=None):
     raise NotImplementedError
 
   def _loss(self, x0, valid_tokens,
@@ -378,7 +379,8 @@ class TrainerBase(L.LightningModule):
      valid_tokens) = self._process_model_input(
        x0, valid_tokens)
     loss = self.nll(input_tokens, output_tokens,
-                    current_accumulation_step, train_mode)
+                    current_accumulation_step, train_mode,
+                    valid_tokens=valid_tokens)
     assert loss.ndim == 2
     if self.ignore_bos:
       loss[:, 1:] = loss[:, 1:]
@@ -456,7 +458,8 @@ class Diffusion(TrainerBase):
     raise NotImplementedError
 
   def nll(self, x0, output_tokens,
-          current_accumulation_step=None, train_mode=False):
+          current_accumulation_step=None, train_mode=False,
+          valid_tokens=None):
     del output_tokens
     t = self._sample_t(x0.shape[0],
                        current_accumulation_step)
@@ -472,7 +475,7 @@ class Diffusion(TrainerBase):
     assert alpha_t.ndim == 2
     sigma = self._sigma_from_alphat(alpha_t)
 
-    xt = self.q_xt(x0, alpha_t)
+    xt = self.q_xt(x0, alpha_t, valid_tokens=valid_tokens)
     log_x_theta = self.forward(xt, sigma=sigma)
     utils.print_nans(log_x_theta, 'model_output')
     return self.nll_per_token(
@@ -627,7 +630,7 @@ class AbsorbingState(Diffusion):
     if self.subs_masking:
       assert self.parameterization == 'mean'
 
-  def q_xt(self, x, alpha_t):
+  def q_xt(self, x, alpha_t, valid_tokens=None):
     """Computes the noisy sample xt.
 
     Args:
@@ -637,6 +640,8 @@ class AbsorbingState(Diffusion):
     """
     move_indices = torch.rand(
       * x.shape, device=x.device) < 1 - alpha_t
+    if valid_tokens is not None:
+      move_indices = move_indices & valid_tokens.bool()
     xt = torch.where(move_indices, self.mask_index, x)
     if self.ignore_bos:
       xt[:, 0] = x[:, 0]
@@ -712,7 +717,7 @@ class UniformState(Diffusion):
     if self.config.algo.name != 'distillation':
       assert self.T == 0
 
-  def q_xt(self, x, alpha_t):
+  def q_xt(self, x, alpha_t, valid_tokens=None):
     """Computes the noisy sample xt.
 
     Args:
@@ -723,6 +728,8 @@ class UniformState(Diffusion):
     """
     move_indices = torch.rand(
       *x.shape, device=x.device) < 1 - alpha_t
+    if valid_tokens is not None:
+      move_indices = move_indices & valid_tokens.bool()
     uniform_tensor = torch.randint(
       0, self.vocab_size, x.shape, device=x.device)
     xt = torch.where(move_indices, uniform_tensor, x)
